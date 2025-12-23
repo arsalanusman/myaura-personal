@@ -7,35 +7,67 @@ export enum MessageRole {
 
 export interface ChatMessage {
   id: string;
-  userId: string; // Phone number
+  userId: string;
   role: MessageRole;
   text: string;
-  image?: string; // Base64 or URL
+  image?: string;
   timestamp: number;
   groundingMetadata?: GroundingMetadata;
 }
 
 export interface GroundingMetadata {
   searchChunks?: { uri: string; title: string }[];
-  mapChunks?: { uri: string; title: string; source: string }[];
+  mapChunks?: { uri: string; title: string; source?: string }[];
 }
 
 export interface ChatSession {
   id: string;
   userId: string;
   timestamp: number;
-  preview: string; // Short text to display in list
+  preview: string;
   messages: ChatMessage[];
 }
 
+export interface SavedStory {
+  id: string;
+  userId: string;
+  title: string;
+  fullText: string;
+  prompt: string;
+  timestamp: number;
+  lastPosition?: number; 
+  totalDuration?: number; 
+  isGenerating?: boolean; 
+  isEncodingAudio?: boolean; 
+  audioData?: string; 
+}
+
+// Added DiaryEntry interface to fix export errors in other files
+export interface DiaryEntry {
+  id: string;
+  userId: string;
+  title?: string;
+  content: string;
+  timestamp: number;
+}
+
 export interface Settings {
-  userId: string; // Phone number serves as ID
+  userId: string;
   name: string;
-  language: string; // e.g., "Romanian", "Italian", "English"
+  aiGender: 'male' | 'female';
+  language: string;
   personality: string;
+  personalityTrait?: string;
+  speakingStyle?: string;
   voiceName: string;
-  useLocalMode: boolean; // New setting for offline/no-AI mode
-  userBio: string; // Long-term memory about the user
+  useLocalMode: boolean;
+  userBio: string;
+  aiProvider: 'gemini';
+  // Added optional Azure config fields to resolve access errors in azureService
+  azureApiKey?: string;
+  azureEndpoint?: string;
+  azureDeployment?: string;
+  azureApiVersion?: string;
 }
 
 export enum AppMode {
@@ -43,7 +75,9 @@ export enum AppMode {
   VOICE = 'voice',
   GALLERY = 'gallery',
   SETTINGS = 'settings',
-  DIARY = 'diary'
+  PLAYER = 'player',
+  GENERATOR = 'generator',
+  PERCHANCE = 'perchance'
 }
 
 export interface GeneratedImage {
@@ -52,14 +86,6 @@ export interface GeneratedImage {
   url: string;
   prompt: string;
   timestamp: number;
-}
-
-export interface DiaryEntry {
-  id: string;
-  userId: string;
-  content: string;
-  timestamp: number;
-  mood?: string;
 }
 
 export interface LearnedInteraction {

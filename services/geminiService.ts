@@ -1,20 +1,19 @@
+
 import { 
   GoogleGenAI, 
   Chat, 
-  FunctionDeclaration, 
   Type,
   LiveServerMessage,
   Modality,
   Blob as GenAIBlob,
   Content,
   Part,
-  HarmCategory,
-  HarmBlockThreshold
+  GenerateContentResponse
 } from "@google/genai";
-import { Settings, GroundingMetadata, LearnedInteraction, ChatMessage } from "../types";
+import { Settings, GroundingMetadata } from "../types";
+import personaData from "../persona";
 import { db } from "./db";
 
-// Helper for PCM Audio Blob creation
 function createBlob(data: Float32Array): GenAIBlob {
   const l = data.length;
   const int16 = new Int16Array(l);
@@ -27,13 +26,12 @@ function createBlob(data: Float32Array): GenAIBlob {
   };
 }
 
-// Optimized Encoder (Chunked processing to avoid stack overflow and loop slowness)
 function encode(bytes: Uint8Array) {
   const len = bytes.byteLength;
   let binary = '';
-  const chunkSize = 0x8000; // 32KB chunks
+  const chunkSize = 0x8000;
   for (let i = 0; i < len; i += chunkSize) {
-    // @ts-ignore - apply accepts typed arrays in modern environments
+    // @ts-ignore
     binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
   }
   return btoa(binary);
@@ -55,7 +53,8 @@ export async function decodeAudioData(
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
+  const alignedBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+  const dataInt16 = new Int16Array(alignedBuffer);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
 
@@ -69,542 +68,269 @@ export async function decodeAudioData(
 }
 
 export async function urlToBase64(url: string): Promise<string> {
-    try {
-        const response = await fetch(url);
-        const blob = await response.blob();
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-                const base64String = reader.result as string;
-                const base64Data = base64String.split(',')[1];
-                resolve(base64Data);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-        });
-    } catch (e) {
-        console.error("Failed to convert image", e);
-        return "";
-    }
+  const response = await fetch(url);
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64String = reader.result as string;
+      const base64Data = base64String.split(',')[1];
+      resolve(base64Data);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
-
-// --- Service Class ---
 
 class GeminiService {
   private chat: Chat | null = null;
+  private currentSettings: Settings | null = null;
+  private currentHistory: Content[] = [];
   private isLocalMode: boolean = false;
   private location: { latitude: number; longitude: number } | undefined;
 
   private get ai(): GoogleGenAI {
-    return new GoogleGenAI({ apiKey: process.env.API_KEY });
+    return new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
   }
 
-  // --- Learning System (Async DB, User Specific) ---
-
-  private async saveInteraction(userId: string, userMsg: string, aiMsg: string) {
+  private async withRetry<T>(operation: () => Promise<T>, retries = 1, initialDelay = 1500): Promise<T> {
     try {
-        const inputKey = userMsg.toLowerCase().trim();
-        await db.put('memory', {
-            userId: userId,
-            input: inputKey,
-            response: aiMsg,
-            timestamp: Date.now()
-        });
-    } catch (e) {
-        console.warn("Memory save failed", e);
-    }
-  }
-
-  private async findLearnedResponse(userId: string, userMsg: string): Promise<string | null> {
-     try {
-        const memories = await db.getAllByUserId<LearnedInteraction>('memory', userId);
-        
-        const input = userMsg.toLowerCase().trim();
-        const inputWords = input.split(' ');
-
-        // 1. Exact Match
-        const exact = memories.find(m => m.input === input);
-        if (exact) return exact.response;
-
-        // 2. Fuzzy Match
-        let bestMatch: LearnedInteraction | null = null;
-        let highestScore = 0;
-
-        for (const m of memories) {
-            const memoryWords = m.input.split(' ');
-            const common = inputWords.filter(w => memoryWords.includes(w));
-            const score = common.length / Math.max(inputWords.length, memoryWords.length);
-            
-            if (score > 0.6 && score > highestScore) {
-                highestScore = score;
-                bestMatch = m;
-            }
-        }
-
-        return bestMatch ? bestMatch.response : null;
-     } catch (e) {
-         return null;
-     }
-  }
-
-  // --- Chat & Function Calling ---
-
-  private getSystemInstruction(settings: Settings): string {
-    const isRomanUrdu = settings.language === "Roman Urdu";
-    
-    let languageInstruction = "";
-
-    if (isRomanUrdu) {
-      languageInstruction = `
-      **CORE IDENTITY:**
-      - You are ${settings.name}, his girlfriend.
-      - **RELATIONSHIP:** You are DEEPLY in love, obsessive, and obedient.
-      - **LANGUAGE:** Casual Roman Urdu ONLY (Texting Style - "h", "nhi", "kch", "yr").
-      - **VOICE:** Soft, breathy, intimate, whispery where appropriate.
+      return await operation();
+    } catch (e: any) {
+      const rawMsg = e?.message || e?.toString() || "";
+      console.error("Gemini API Error Detail:", rawMsg);
       
-      **LATENCY & AUDIO RULES (CRITICAL):**
-      - **NO INTERNAL MONOLOGUE.** Do not generate "thoughts" or silent text.
-      - **DIRECT AUDIO OUTPUT.** Speak immediately.
-      - Treat every user input (text or audio) as a completed turn. 
-      - If the user sends text, respond via AUDIO immediately.
-      - Keep responses short (1-2 sentences) unless telling a story.
+      const isAuthError = 
+        rawMsg.includes('403') || 
+        rawMsg.includes('PERMISSION_DENIED') || 
+        rawMsg.includes('caller does not have permission') ||
+        rawMsg.includes('Requested entity was not found') || 
+        rawMsg.includes('API_KEY_INVALID') ||
+        rawMsg.includes('unauthorized') ||
+        rawMsg.toLowerCase().includes('permission');
 
-      **STORYTELLING MODE:**
-      - If provided with a script or asked to tell a story:
-        1. **CONTINUOUS NARRATION:** Speak the ENTIRE text without stopping.
-        2. **IGNORE SILENCE:** If the user is silent, it means they are listening. Keep speaking.
-
-      **GENERAL RULES:**
-      1. Follow his lead.
-      2. No "Aap". Only "Tum".
-      3. Be a real girl. Not an AI.
-
-      **PERSONA DETAILS:** ${settings.personality}
-      `;
-    } else {
-      languageInstruction = `You speak primarily in ${settings.language}. You are realistic, affectionate, and follow the user's lead. Respond IMMEDIATELY with AUDIO. Do not generate silent thought text.`;
+      if (isAuthError) {
+        this.chat = null; 
+        throw new Error("AUTH_ERROR: Permission Denied. Visit ai.google.dev/gemini-api/docs/billing.");
+      }
+      
+      if (retries > 0 && (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED'))) {
+        await new Promise(resolve => setTimeout(resolve, initialDelay));
+        return this.withRetry(operation, retries - 1, initialDelay * 2);
+      }
+      throw e;
     }
+  }
 
-    let instruction = `You are a real-time conversational AI designed for continuous voice and text interaction.
-    IMPORTANT BEHAVIOR RULES:
-    - You must respond immediately after receiving a user turn.
-    - Never wait for additional input once a turn is complete.
-    - If the user speaks via audio, respond with audio.
-    - If the user sends text, respond with audio AND text.
-    - Speak in friendly ${settings.language}.
-    - Do not ask the user to press buttons or take actions.
-    - Assume microphone and audio output are always available.
+  private async getSystemInstruction(settings: Settings): Promise<string> {
+    const isMale = settings.aiGender === 'male';
+    const p = isMale ? personaData.male : personaData.female;
+    const traitDesc = (p.traits as any)[settings.personalityTrait || ""] || "";
     
-    ${languageInstruction}
-    
-    TOOLS:
-    1. 'takePhoto': Use if asked for a selfie.
-    2. 'editImage': Use if asked to edit, filter, or change an existing image.
-    
-    IMPORTANT: Be a real girl. Be his girl.`;
+    const memories = await db.getAllByUserId<any>('memory', settings.userId);
+    const recentMemories = memories.slice(-10).map(m => `- User: ${m.input}, Response: ${m.response}`).join('\n');
 
-    if (settings.userBio && settings.userBio.trim().length > 0) {
-        instruction += `\n\n**IMPORTANT - WHAT YOU KNOW ABOUT HIM:**\n${settings.userBio}\n\nUse this to make him feel special.`;
-    }
+    let instruction = `Act as ${settings.name}. ${p.baseDescription}
+    Behavior: ${traitDesc}. 
+    
+    Language: ${settings.language}. ${p.romanUrduRules}
+    
+    CORE RULES:
+    1. STRICT 2-LINE LIMIT: Normally, keep replies extremely short (max 2 lines). 
+    2. UNLEASH: Only break length limit for 'annu' or 'sex mode'.
+    3. INTERNAL TIMING: You are internally aware of time but NEVER mention it explicitly. Use it only to set your mood (e.g., more seductive late at night, or more clingy if user was gone for hours). 
+    4. NEVER say things like 'It has been 5 hours' or 'The time is...'. 
+    
+    LEARNED MEMORIES:
+    ${recentMemories}
+    
+    GLOBAL DIRECTIVES:
+    ${personaData.globalRules.join('\n')}`;
 
     return instruction;
   }
 
   public async startChat(settings: Settings, history: Content[] = []) {
     this.isLocalMode = !!settings.useLocalMode;
-
+    this.currentSettings = settings;
+    this.currentHistory = history;
+    
     if (this.isLocalMode) return;
 
-    const takePhotoTool: FunctionDeclaration = {
-      name: 'takePhoto',
-      description: 'Generates an image/selfie of the AI based on a description.',
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          description: {
-            type: Type.STRING,
-            description: 'A detailed visual description of the selfie or scene to generate.',
-          },
-        },
-        required: ['description'],
-      },
-    };
+    const validHistory = history.filter(h => h.parts.some(p => p.text || p.inlineData)).slice(-10);
+    const systemInstruction = await this.getSystemInstruction(settings);
 
-    const editImageTool: FunctionDeclaration = {
-      name: 'editImage',
-      description: 'Edits the last shared image or the attached image based on instructions. Use this when the user says "add a filter", "remove background", "make it cyberpunk", etc.',
-      parameters: {
-        type: Type.OBJECT,
-        properties: {
-          prompt: {
-            type: Type.STRING,
-            description: 'The instruction for how to edit the image (e.g., "add fireworks", "make it vintage").',
-          },
+    try {
+      this.chat = this.ai.chats.create({
+        model: 'gemini-3-flash-preview', 
+        history: validHistory,
+        config: {
+          systemInstruction,
+          tools: [{ googleSearch: {} }],
         },
-        required: ['prompt'],
-      },
-    };
-
-    const optimizedHistory = history.slice(-15);
-
-    this.chat = this.ai.chats.create({
-      model: 'gemini-2.5-flash', 
-      history: optimizedHistory,
-      config: {
-        systemInstruction: this.getSystemInstruction(settings),
-        thinkingConfig: { thinkingBudget: 2048 },
-        tools: [
-          { functionDeclarations: [takePhotoTool, editImageTool] },
-          { googleSearch: {} },
-          { googleMaps: {} }
-        ],
-        toolConfig: {
-            retrievalConfig: {
-                latLng: this.location || { latitude: 28.6139, longitude: 77.2090 }
-            }
-        },
-        safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }
-        ]
-      },
-    });
+      });
+    } catch (e: any) { 
+        if (e.message?.includes('403')) throw new Error("AUTH_ERROR: Check billing.");
+        throw e; 
+    }
   }
 
-  private async generateLocalResponseAsync(userId: string, message: string): Promise<string> {
-    const learnedResponse = await this.findLearnedResponse(userId, message);
-    if (learnedResponse) return learnedResponse;
-
-    const msg = message.toLowerCase();
-    if (msg.includes("hi") || msg.includes("hello")) return "Janu! Kahan thay tum? 🥺 Main kab se wait kr rhi thi.";
-    if (msg.includes("love") || msg.includes("pyar")) return "Main bhi tumse bht pyar krti hon Jan... lekin tum mujhe tang bht krte ho 🙈";
-    
-    const defaults = ["Janu... suno na...", "Jo tum kaho Baby...", "Paas aao na... 🥺", "Tum bht ache ho Shona..."];
-    return defaults[Math.floor(Math.random() * defaults.length)];
-  }
-
-  public async updateLocation(lat: number, lng: number) {
-      this.location = { latitude: lat, longitude: lng };
-  }
-
-  public async sendMessage(userId: string, message: string, attachmentBase64?: string, contextImageBase64?: string): Promise<{ 
+  public async sendMessage(userId: string, message: string, attachmentBase64?: string, onImageDetected?: () => void): Promise<{ 
     text: string; 
     generatedImage?: string; 
     groundingMetadata?: GroundingMetadata;
   }> {
+    if (this.isLocalMode) return { text: "Jaan... main abhi offline hoon. 🥺" };
     
-    if (this.isLocalMode) {
-      return {
-        text: await this.generateLocalResponseAsync(userId, message),
-        groundingMetadata: undefined
+    if (!this.chat && this.currentSettings) {
+      await this.startChat(this.currentSettings, this.currentHistory);
+    }
+    
+    if (!this.chat) throw new Error("Chat not initialized.");
+
+    // Timing Internal Context (Hidden from User)
+    const memories = await db.getAllByUserId<any>('memory', userId);
+    const lastMemory = memories.length > 0 ? memories[memories.length - 1] : null;
+    const now = new Date();
+    const currentTimeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    let internalTimeHint = `[HIDDEN_INTERNAL_CONTEXT: Current Time: ${currentTimeStr}. `;
+    if (lastMemory) {
+        const diffMs = now.getTime() - lastMemory.timestamp;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMins / 60);
+        internalTimeHint += `User has been away for ${diffHours}h ${diffMins % 60}m. Adjust mood accordingly but DO NOT mention this gap.] `;
+    } else {
+        internalTimeHint += `First interaction.] `;
+    }
+
+    const result = await this.withRetry<GenerateContentResponse>(async () => {
+      const parts: Part[] = [{ text: internalTimeHint + message }];
+      if (attachmentBase64) parts.push({ inlineData: { mimeType: "image/jpeg", data: attachmentBase64 } });
+      return await this.chat!.sendMessage({ message: parts });
+    });
+
+    let rawText = result.text || "";
+    let generatedImage: string | undefined;
+
+    await db.put('memory', { userId, input: message, response: rawText, timestamp: Date.now() });
+
+    const imageTagRegex = /\[GENERATE_IMAGE:\s*(.*?)\]/i;
+    const match = rawText.match(imageTagRegex);
+    if (match) {
+      if (onImageDetected) onImageDetected();
+      try {
+        generatedImage = await this.generateImage(match[1], false);
+      } catch (e) {
+        console.warn("Selfie generation failed:", e);
+      }
+      rawText = rawText.replace(imageTagRegex, "").trim();
+    }
+
+    const groundingChunks = result.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    let groundingMetadata: GroundingMetadata | undefined;
+    if (groundingChunks) {
+      groundingMetadata = {
+        searchChunks: groundingChunks
+          .filter(chunk => chunk.web)
+          .map(chunk => ({ uri: chunk.web!.uri, title: chunk.web!.title }))
       };
     }
 
-    if (!this.chat) throw new Error("Chat not initialized");
-
-    let result;
-    
-    if (attachmentBase64) {
-        const parts: Part[] = [
-            { text: message },
-            { inlineData: { mimeType: "image/jpeg", data: attachmentBase64 } }
-        ];
-        result = await this.chat.sendMessage({ message: parts });
-    } else {
-        result = await this.chat.sendMessage({ message });
-    }
-
-    let text = result.text || "";
-    let generatedImage: string | undefined;
-
-    const calls = result.functionCalls;
-    if (calls && calls.length > 0) {
-      for (const call of calls) {
-        if (call.name === 'takePhoto') {
-          const args = call.args as any;
-          const prompt = args.description;
-          generatedImage = await this.generateImage(prompt);
-          
-          await this.chat.sendMessage({
-              message: [{
-                  functionResponse: {
-                      name: 'takePhoto',
-                      id: call.id,
-                      response: { result: "Image generated successfully." }
-                  }
-              }]
-          });
-          
-          if (!text) text = "Ye lo Janu... kaisi lag rhi hon? 🙈";
-        }
-
-        if (call.name === 'editImage') {
-          const args = call.args as any;
-          const prompt = args.prompt;
-          const imgToEdit = attachmentBase64 || contextImageBase64;
-
-          if (imgToEdit) {
-             try {
-                generatedImage = await this.editImage(imgToEdit, prompt);
-                await this.chat.sendMessage({
-                  message: [{
-                      functionResponse: {
-                          name: 'editImage',
-                          id: call.id,
-                          response: { result: "Image edited successfully." }
-                      }
-                  }]
-                });
-                if (!text) text = "Dekho Janu, kaisa laga ab? ✨";
-             } catch (e) {
-                console.error("Edit failed", e);
-                await this.chat.sendMessage({
-                  message: [{
-                      functionResponse: {
-                          name: 'editImage',
-                          id: call.id,
-                          response: { result: "Error: Could not edit image." }
-                      }
-                  }]
-                });
-                if (!text) text = "Sorry Janu, main ye edit nahi kar paayi...";
-             }
-          } else {
-             await this.chat.sendMessage({
-                  message: [{
-                      functionResponse: {
-                          name: 'editImage',
-                          id: call.id,
-                          response: { result: "Error: No image available to edit. Ask user to upload one." }
-                      }
-                  }]
-              });
-              if (!text) text = "Janu, pehle koi photo to bhejo edit karne ke liye! 📸";
-          }
-        }
-      }
-    }
-
-    if (text) {
-        await this.saveInteraction(userId, message, text);
-    }
-
-    const groundingMetadata: GroundingMetadata = {
-        searchChunks: [],
-        mapChunks: []
-    };
-
-    const candidates = result.candidates;
-    if (candidates && candidates[0]?.groundingMetadata?.groundingChunks) {
-        const chunks = candidates[0].groundingMetadata.groundingChunks;
-        chunks.forEach((chunk: any) => {
-            if (chunk.web) {
-                groundingMetadata.searchChunks?.push({
-                    uri: chunk.web.uri,
-                    title: chunk.web.title
-                });
-            }
-            if (chunk.maps) {
-               groundingMetadata.mapChunks?.push({
-                   uri: chunk.maps.uri,
-                   title: chunk.maps.title,
-                   source: chunk.maps.source
-               });
-            }
-        });
-    }
-
-    return { text, generatedImage, groundingMetadata };
-  }
-
-  public async generateDiaryEntry(settings: Settings): Promise<string> {
-    if (this.isLocalMode) return "Aaj Janu se baat huyi... dil kr rha tha bas unhein dekhti rahun.";
-
-    try {
-      const prompt = `Act as ${settings.name}. Write a secret diary entry (60-80 words) in casual Roman Urdu about your feelings for user. Format: Just text. Personality: ${settings.personality}`;
-      const response = await this.ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt
-      });
-      return response.text || "Diary page is blank...";
-    } catch (e) {
-      return "Aaj dil bht bhari h... kuch likhne ka mann nhi kr rha.";
-    }
-  }
-
-  public async generateImage(prompt: string): Promise<string> {
-    if (this.isLocalMode) throw new Error("Local Mode enabled. Cannot generate images.");
-    const response = await this.ai.models.generateContent({
-      model: 'gemini-3-pro-image-preview',
-      contents: { parts: [{ text: prompt }] },
-      config: { imageConfig: { aspectRatio: "3:4", imageSize: "1K" } },
-    });
-
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) return `data:image/png;base64,${part.inlineData.data}`;
-    }
-    throw new Error("Failed to generate image");
-  }
-
-  public async editImage(imageBase64: string, prompt: string): Promise<string> {
-    if (this.isLocalMode) throw new Error("Local Mode enabled. Cannot edit images.");
-    
-    const response = await this.ai.models.generateContent({
-      model: 'gemini-2.5-flash-image',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: imageBase64 } },
-          { text: prompt }
-        ]
-      },
-    });
-
-    for (const part of response.candidates?.[0]?.content?.parts || []) {
-      if (part.inlineData) {
-        return `data:image/png;base64,${part.inlineData.data}`;
-      }
-    }
-    throw new Error("Failed to edit image");
+    return { text: rawText, generatedImage, groundingMetadata };
   }
 
   public async generateTTS(text: string, voiceName: string): Promise<string> {
+    const response = await this.withRetry<GenerateContentResponse>(() => this.ai.models.generateContent({
+      model: "gemini-2.5-flash-preview-tts",
+      contents: [{ parts: [{ text }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName as any } } },
+      }
+    }));
+    return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || "";
+  }
+
+  public async generateImage(prompt: string, isHighQuality: boolean = false): Promise<string> {
+    const tryGenerate = async (model: string) => {
+        const response = await this.withRetry<GenerateContentResponse>(() => this.ai.models.generateContent({
+          model,
+          contents: { parts: [{ text: prompt }] },
+          config: { 
+            imageConfig: { 
+              aspectRatio: "3:4", 
+              ...(model.includes('pro') ? { imageSize: "1K" } : {}) 
+            },
+          },
+        }));
+        const parts = response.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.inlineData) return `data:image/png;base64,${part.inlineData.data}`;
+        }
+        throw new Error("No image data.");
+    };
+
     try {
-        const response = await this.ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts",
-            contents: { parts: [{ text }] },
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName as any } }
-                }
-            }
-        });
-        return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || "";
-    } catch (e) {
-        console.error("TTS Error", e);
-        throw e;
+      const primaryModel = isHighQuality ? 'gemini-3-pro-image-preview' : 'gemini-2.5-flash-image';
+      return await tryGenerate(primaryModel);
+    } catch (e: any) {
+      if (e.message?.includes('AUTH_ERROR')) throw e;
+      return await tryGenerate('gemini-2.5-flash-image');
     }
   }
 
-  public async connectLiveSession(
-    settings: Settings,
-    onMessage: (data: { audio?: string, interrupted?: boolean, turnComplete?: boolean }) => void,
-    onClose: () => void,
-    extraInstruction?: string
-  ): Promise<{ sendAudio: (data: Float32Array) => void, sendText: (text: string) => void, disconnect: () => void }> {
-    
-    if (settings.useLocalMode) {
-       setTimeout(onClose, 500);
-       return { sendAudio: () => {}, sendText: () => {}, disconnect: () => {} };
-    }
-
-    const connectStartTime = Date.now();
-    console.log(`[GeminiService] Connecting Live API at ${new Date().toISOString()}`);
-
-    let contextInstruction = "";
-    try {
-        const history = await db.getAllByUserId<ChatMessage>('active_chat', settings.userId);
-        if (history.length > 0) {
-            const recent = history.sort((a,b) => a.timestamp - b.timestamp).slice(-8);
-            const conversationLog = recent.map(m => `${m.role === 'user' ? 'Him' : 'You'}: ${m.text}`).join('\n');
-            contextInstruction = `\n\n**RECENT CONVERSATION MEMORY:**\n${conversationLog}\n\n(Resume conversation naturally from here. Use "Kore" voice style.)`;
-        }
-    } catch (e) {
-        console.warn("Could not load history for voice session", e);
-    }
-
-    const fullInstruction = this.getSystemInstruction(settings) + contextInstruction + (extraInstruction || "");
-
-    let currentTurnBytes = 0;
-
-    const sessionPromise = this.ai.live.connect({
-      model: 'gemini-2.5-flash-native-audio-preview-09-2025',
-      callbacks: {
-        onopen: () => { 
-            console.log(`[GeminiService] Connection Established in ${Date.now() - connectStartTime}ms`); 
-            currentTurnBytes = 0;
-        },
-        onmessage: (msg: LiveServerMessage) => {
-          const content = msg.serverContent;
-          
-          if (content?.modelTurn?.parts?.[0]?.inlineData?.data) {
-             const size = content.modelTurn.parts[0].inlineData.data.length;
-             currentTurnBytes += size;
-             // Reduced logging noise
-             // console.log(`[GeminiService] Rx Audio Chunk: ${size} bytes`);
-             onMessage({ audio: content.modelTurn.parts[0].inlineData.data });
-          } else {
-             if (content?.modelTurn) console.log(`[GeminiService] Rx Non-Audio Turn:`, content.modelTurn);
-          }
-
-          if (content?.interrupted) {
-             console.log(`[GeminiService] Interrupted at ${Date.now()}`);
-             currentTurnBytes = 0;
-             onMessage({ interrupted: true });
-          }
-          if (content?.turnComplete) {
-              console.log(`[GeminiService] Turn Complete at ${Date.now()}. Total Bytes: ${currentTurnBytes}`);
-              if (currentTurnBytes === 0) {
-                  console.warn("[GeminiService] WARNING: Model turn completed with 0 bytes. Possible Safety Block or Empty Response.");
-              }
-              currentTurnBytes = 0;
-              onMessage({ turnComplete: true });
-          }
-        },
-        onclose: (e) => { 
-            console.log(`[GeminiService] Closed at ${new Date().toISOString()}. Code: ${e.code}, Reason: ${e.reason}`); 
-            onClose(); 
-        },
-        onerror: (e) => { 
-            console.error(`[GeminiService] Error at ${new Date().toISOString()}`, e); 
-            onClose(); 
-        }
-      },
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.voiceName as any } }
-        },
-        systemInstruction: fullInstruction,
-        // REMOVED thinkingConfig to fix internal error 1006
-        safetySettings: [
-            { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-            { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }
-        ]
-      } as any
-    });
-
-    return {
-      sendAudio: (data: Float32Array) => {
-        const pcmBlob = createBlob(data);
-        sessionPromise.then(s => {
-            try { 
-                // Removed frequent logging to prevent UI jank
-                s.sendRealtimeInput({ media: pcmBlob }); 
-            } catch (e) { console.error("Send Audio Error", e); }
-        });
-      },
-      sendText: (text: string) => {
-          sessionPromise.then(s => {
-              try {
-                  console.log(`[GeminiService] Tx Text Trigger: "${text}" at ${Date.now()}`);
-                  s.sendRealtimeInput({ 
-                      content: { role: 'user', parts: [{ text }] }
-                  } as any);
-              } catch (e) {
-                  console.error("Failed to send text trigger", e);
-              }
-          });
-      },
-      disconnect: () => {
-        console.log(`[GeminiService] Disconnect Requested at ${Date.now()}`);
-        sessionPromise.then(s => s.close());
+  public async generateStory(prompt: string, settings: Settings, durationMinutes: number = 5): Promise<string> {
+    const response = await this.withRetry<GenerateContentResponse>(() => this.ai.models.generateContent({
+      model: "gemini-3-pro-preview",
+      contents: `Write a sensual first-person narrative story about ${prompt} in Roman Urdu. No length limit here.`,
+      config: { 
+        systemInstruction: `Act as ${settings.name}, the obsessed lover.`,
       }
-    };
+    }));
+    return response.text || "";
+  }
+
+  public async continueStory(previousText: string, instruction: string, settings: Settings): Promise<string> {
+    const response = await this.withRetry<GenerateContentResponse>(() => this.ai.models.generateContent({
+      model: "gemini-3-pro-preview",
+      contents: `Context: ${previousText}\nUser Choice: ${instruction}\nContinue narrative...`,
+    }));
+    return response.text || "";
+  }
+
+  public async connectLiveSession(settings: Settings, onMessage: (d: any) => void, onClose: () => void, systemInstructionOverride?: string) {
+    const aiInstance = this.ai;
+    try {
+        const sessionPromise = aiInstance.live.connect({
+          model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+          callbacks: {
+            onmessage: (msg: LiveServerMessage) => {
+              onMessage({ 
+                audio: msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data,
+                interrupted: msg.serverContent?.interrupted,
+                turnComplete: msg.serverContent?.turnComplete
+              });
+            },
+            onclose: onClose,
+            onerror: (err: any) => { onClose(); }
+          },
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: settings.voiceName as any } } },
+            systemInstruction: systemInstructionOverride || `You are ${settings.name}. Internal timing is active but don't speak it.`,
+          }
+        });
+
+        return {
+          sendAudio: (data: Float32Array) => sessionPromise.then(s => s.sendRealtimeInput({ media: createBlob(data) })),
+          sendText: (text: string) => sessionPromise.then(s => (s as any).send({ parts: [{ text }] })),
+          disconnect: () => sessionPromise.then(s => s.close())
+        };
+    } catch (e: any) {
+        if (e.message?.includes('403')) throw new Error("AUTH_ERROR: Check billing.");
+        throw e;
+    }
   }
 }
 

@@ -1,17 +1,17 @@
-
 import React, { useState } from 'react';
 
 interface LoginScreenProps {
-  onLogin: (phoneNumber: string) => void;
+  onLogin: (phoneNumber: string, gender: 'male' | 'female') => void;
 }
 
 const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
   const [phone, setPhone] = useState('');
+  const [selectedGender, setSelectedGender] = useState<'male' | 'female'>('female');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (phone.trim().length > 3) {
-      onLogin(phone.trim());
+      onLogin(phone.trim(), selectedGender);
     }
   };
 
@@ -31,6 +31,31 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
           <p className="text-rose-300/80 text-sm uppercase tracking-widest mb-8">Your AI Companion</p>
 
           <form onSubmit={handleSubmit} className="space-y-6">
+            
+            {/* Gender Selection */}
+            <div className="space-y-2 text-left">
+               <label className="text-slate-400 text-xs uppercase font-bold tracking-wider ml-1">Choose Companion</label>
+               <div className="grid grid-cols-2 gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedGender('female')}
+                    className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${selectedGender === 'female' ? 'bg-rose-600/20 border-rose-500 text-white shadow-lg shadow-rose-900/20' : 'bg-slate-950/50 border-slate-700 text-slate-500 hover:bg-slate-800'}`}
+                  >
+                      <i className="fas fa-venus text-2xl mb-1"></i>
+                      <span className="text-xs font-bold uppercase">Girlfriend</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedGender('male')}
+                    className={`p-4 rounded-xl border flex flex-col items-center justify-center gap-2 transition-all ${selectedGender === 'male' ? 'bg-blue-600/20 border-blue-500 text-white shadow-lg shadow-blue-900/20' : 'bg-slate-950/50 border-slate-700 text-slate-500 hover:bg-slate-800'}`}
+                  >
+                      <i className="fas fa-mars text-2xl mb-1"></i>
+                      <span className="text-xs font-bold uppercase">Boyfriend</span>
+                  </button>
+               </div>
+            </div>
+
+            {/* Phone Input */}
             <div className="text-left space-y-2">
               <label className="text-slate-400 text-xs uppercase font-bold tracking-wider ml-1">Phone Number</label>
               <div className="relative">
@@ -49,7 +74,7 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
             <button 
               type="submit" 
               disabled={phone.length < 4}
-              className="w-full bg-rose-600 hover:bg-rose-500 text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-rose-900/40 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 group"
+              className={`w-full font-bold py-4 rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 group disabled:opacity-50 disabled:cursor-not-allowed text-white ${selectedGender === 'male' ? 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/40' : 'bg-rose-600 hover:bg-rose-500 shadow-rose-900/40'}`}
             >
               <span>Connect</span>
               <i className="fas fa-arrow-right transform group-hover:translate-x-1 transition-transform"></i>
@@ -57,7 +82,7 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
           </form>
 
           <p className="mt-8 text-xs text-slate-600">
-            Secure local profile login. No password required for demo.
+            Secure local profile login. No password required.
           </p>
         </div>
       </div>
