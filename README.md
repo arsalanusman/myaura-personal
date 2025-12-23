@@ -15,6 +15,24 @@ View your app in AI Studio: https://ai.studio/apps/drive/1FkRfxEIn0thb-iosCtlyVh
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+
+2. Set up your API key:
+   - Copy `.env.example` to `.env.local`:
+     ```bash
+     cp .env.example .env.local
+     ```
+   - Edit `.env.local` and replace `YOUR_API_KEY_HERE` with your actual Gemini API key
+   - Get your API key from: https://aistudio.google.com/app/apikey
+
 3. Run the app:
    `npm run dev`
+
+## Troubleshooting API Key Issues
+
+If you encounter API key errors:
+
+1. **Verify your `.env.local` file exists** in the project root directory
+2. **Check the format** - it should contain: `GEMINI_API_KEY=your_actual_key`
+3. **No quotes needed** around the API key value
+4. **Restart the dev server** after changing the `.env.local` file
+5. **Ensure billing is enabled** - Visit https://ai.google.dev/gemini-api/docs/billing for details
