@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import ChatInterface from './components/ChatInterface';
 import VoiceInterface from './components/VoiceInterface';
 import StoryPlayer from './components/StoryPlayer';
@@ -7,7 +7,6 @@ import LoginScreen from './components/LoginScreen';
 import CreativeStudio from './components/CreativeStudio';
 import PerchanceGenerator from './components/PerchanceGenerator';
 import { AppMode, GeneratedImage, Settings } from './types';
-import { geminiService } from './services/geminiService';
 import { db } from './services/db';
 import personaData from './persona';
 
@@ -16,14 +15,6 @@ const App: React.FC = () => {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [gallery, setGallery] = useState<GeneratedImage[]>([]);
-  const [hasApiKey, setHasApiKey] = useState(false);
-
-  useEffect(() => {
-    const checkKey = async () => {
-      if (window.aistudio && await window.aistudio.hasSelectedApiKey()) setHasApiKey(true);
-    };
-    checkKey();
-  }, []);
 
   const handleLogin = async (phone: string, gender: 'male' | 'female') => {
     const savedSettings = await db.getSettings(phone);
@@ -59,26 +50,6 @@ const App: React.FC = () => {
   if (!isLoggedIn) return <LoginScreen onLogin={handleLogin} />;
   if (!settings) return null;
 
-  if (!hasApiKey && !settings.useLocalMode) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center space-y-8 bg-[#050505]">
-        <div className="w-20 h-20 rounded-3xl btn-rose flex items-center justify-center shadow-2xl">
-          <i className="fas fa-key text-3xl text-white"></i>
-        </div>
-        <div className="space-y-2">
-          <h1 className="text-3xl font-serif italic tracking-wide">Aura Access</h1>
-          <p className="text-slate-500 text-sm max-w-xs mx-auto">Connect your API key to continue our private chat... 💦</p>
-        </div>
-        <button 
-          onClick={() => window.aistudio?.openSelectKey().then(() => setHasApiKey(true))}
-          className="px-8 py-4 btn-rose rounded-2xl font-bold uppercase tracking-widest text-sm"
-        >
-          Connect API Key
-        </button>
-      </div>
-    );
-  }
-
   return (
     <div className="flex flex-col h-full w-full bg-[#050505] relative overflow-hidden">
       {/* Content Area */}
@@ -87,7 +58,7 @@ const App: React.FC = () => {
           <ChatInterface 
             settings={settings} 
             onImageGenerated={addImageToGallery} 
-            onAuthError={() => setHasApiKey(false)}
+            onAuthError={() => {}}
             sharedImage={null}
             onClearSharedImage={() => {}}
           />
@@ -98,7 +69,7 @@ const App: React.FC = () => {
             settings={settings} 
             isVisible={true} 
             onEndCall={() => setMode(AppMode.CHAT)} 
-            onAuthError={() => setHasApiKey(false)} 
+            onAuthError={() => {}} 
           />
         )}
 
@@ -134,7 +105,7 @@ const App: React.FC = () => {
 
         {mode === AppMode.PLAYER && (
           <div className="h-full pb-32">
-             <StoryPlayer settings={settings} onAuthError={() => setHasApiKey(false)} />
+             <StoryPlayer settings={settings} onAuthError={() => {}} />
           </div>
         )}
 
